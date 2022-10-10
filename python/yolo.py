@@ -2,6 +2,12 @@ import cv2
 import time
 import sys
 import numpy as np
+import shutil
+import os
+import re
+import threading
+import boto3
+from datetime import datetime
 
 def build_model(is_cuda):
     net = cv2.dnn.readNet("config_files/yolov5s.onnx")
@@ -28,7 +34,8 @@ def detect(image, net):
     return preds
 
 def load_capture():
-    capture = cv2.VideoCapture("sample.mp4")
+    #capture = cv2.VideoCapture("sample.mp4")
+    capture = cv2.VideoCapture(0)
     return capture
 
 def load_classes():
@@ -95,6 +102,26 @@ def format_yolov5(frame):
     return result
 
 
+running = True
+
+s3 = boto3.resource('s3')
+bucket = s3.Bucket('video-predicted')
+
+def upload():
+    while running:
+        # YYYYmmddHHMM
+        files = [f for f in os.listdir() if re.search(r'^[\d]{12}.mp4', f)]
+        for file in files:
+            print(f"uploading {file}")
+            # upload
+            bucket.upload_file(file, file)
+            # remove
+            os.remove(file)
+        time.sleep(2)
+
+th = threading.Thread(target=upload)
+th.start()
+
 colors = [(255, 255, 0), (0, 255, 0), (0, 255, 255), (255, 0, 0)]
 
 is_cuda = len(sys.argv) > 1 and sys.argv[1] == "cuda"
@@ -107,6 +134,14 @@ frame_count = 0
 total_frames = 0
 fps = -1
 
+to_predict = ["person", "cat", "dog"]
+to_predict_ids = [i for i, v in enumerate(class_list) if v in to_predict]
+is_save = False
+fmt = cv2.VideoWriter_fourcc(*"mp4v")
+writer = None
+
+timestamp = datetime.now().strftime("%Y%m%d%H%M")
+
 while True:
 
     _, frame = capture.read()
@@ -118,6 +153,9 @@ while True:
     outs = detect(inputImage, net)
 
     class_ids, confidences, boxes = wrap_detection(inputImage, outs[0])
+
+    if len([c for c in class_ids if c in to_predict_ids]) != 0:
+        is_save = True
 
     frame_count += 1
     total_frames += 1
@@ -140,8 +178,33 @@ while True:
 
     cv2.imshow("output", frame)
 
-    if cv2.waitKey(1) > -1:
+    if writer is None and fps > 0:
+        w, h = frame.shape[1], frame.shape[0]
+        writer = cv2.VideoWriter(f".{timestamp}.mp4", cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+
+    if writer:
+        writer.write(frame)
+       
+        # update timestamp
+        new_timestamp = datetime.now().strftime("%Y%m%d%H%M")
+        if timestamp != new_timestamp:
+            writer.release()
+            writer = None
+            if is_save:
+                print(f"save {timestamp}.mp4")
+                shutil.move(f".{timestamp}.mp4", f"{timestamp}.mp4")
+            else:
+                print(f"remove {timestamp}.mp4")
+                os.remove(f".{timestamp}.mp4")
+            is_save = False
+            timestamp = new_timestamp
+
+    if cv2.waitKey(1) & 0xff == ord('q'):
         print("finished by user")
+        running = False
+        if writer:
+            writer.release()
         break
 
+th.join()
 print("Total frames: " + str(total_frames))
